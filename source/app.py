@@ -103,7 +103,8 @@ class UnrealManagerApp(Tk):
         self._button_add = Button(toolbar, text="[+] Add", underline=4, command=self._on_add_button_clicked)
         self._button_add.pack(side="left", padx=4, expand=True, fill="x")
         self._bind_status_info(self._button_add, "Install a new Unreal Engine version from a ZIP archive.")
-        self._button_remove = Button(toolbar, text="[–] Delete", underline=4, command=self._on_remove_button_clicked)
+        self._button_remove = Button(toolbar, text="[–] Delete", underline=4,
+                                     command=self._on_remove_button_clicked, state="disabled")
         self._button_remove.pack(side="left", padx=4, expand=True, fill="x")
         self._bind_status_info(self._button_remove, "Uninstall the selected Unreal Engine version.")
 
@@ -135,6 +136,8 @@ class UnrealManagerApp(Tk):
         self._button_launch.pack(side="right")
         self._bind_status_info(self._button_launch, "Launch the editor for the selected version and exit.")
         self._selected_version = StringVar()
+        self._selected_version.trace_add("write", lambda *_: self._button_remove.configure(
+            state="normal" if self._selected_version.get() else "disabled"))
         self._version_cards = {}  # radiobutton widgets keyed by version name
         self._setup_bindings()
         self.refresh()
@@ -303,13 +306,26 @@ class UnrealManagerApp(Tk):
         """
         Handle clicks on the Remove button to uninstall a version.
         """
+        if not self._selected_version.get():
+            return
         proceed = tk_msgbox_askyesno(title="Confirmation",
                                      message=f"Are you sure you want to uninstall {self._selected_version.get()}?")
         if not proceed:
             return
-        sh_rmtree(f"{INSTALL_ROOT}/{self._selected_version.get()}")
-        system.remove_desktop_file(self._selected_version.get())
-        self.refresh()
+        dlg = Toplevel(self, background=_COLOR_BG_DARK)
+        dlg.title("Uninstalling")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        Label(dlg, text=f"Uninstalling {self._selected_version.get()}...").pack(expand=True, padx=40, pady=20)
+        Thread(target=lambda: (
+            sh_rmtree(f"{INSTALL_ROOT}/{self._selected_version.get()}"),
+            system.remove_desktop_file(self._selected_version.get()),
+            self.after(0, lambda: (
+                dlg.destroy(),
+                self.refresh(),
+                self._selected_version.set("") if not self.versions else None))
+        ), daemon=True).start()
 
     @staticmethod
     def _ensure_install_root_access():
