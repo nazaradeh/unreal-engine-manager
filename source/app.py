@@ -7,7 +7,7 @@ from pathlib import Path
 from shlex import quote
 from shutil import rmtree as sh_rmtree, move as sh_move
 from subprocess import run, CalledProcessError
-from threading import Thread
+from threading import Event, Thread
 from tkinter import Tk, Canvas, StringVar, Toplevel, PhotoImage
 from tkinter.filedialog import askopenfilename as tk_filedialog_askopenfilename
 from tkinter.messagebox import (showerror as tk_msgbox_showerror, askyesno as tk_msgbox_askyesno,
@@ -85,6 +85,7 @@ class UnrealManagerApp(Tk):
 
         self._versions = dict[str, Path]()  # {name: path}
         self._install_thread: Thread
+        self._install_cancel: Event
 
         # Header
         header = Frame(self, padding=(12, 8))
@@ -103,7 +104,8 @@ class UnrealManagerApp(Tk):
         self._button_add = Button(toolbar, text="[+] Add", underline=4, command=self._on_add_button_clicked)
         self._button_add.pack(side="left", padx=4, expand=True, fill="x")
         self._bind_status_info(self._button_add, "Install a new Unreal Engine version from a ZIP archive.")
-        self._button_remove = Button(toolbar, text="[–] Delete", underline=4, command=self._on_remove_button_clicked)
+        self._button_remove = Button(toolbar, text="[–] Delete", underline=4,
+                                     command=self._on_remove_button_clicked, state="disabled")
         self._button_remove.pack(side="left", padx=4, expand=True, fill="x")
         self._bind_status_info(self._button_remove, "Uninstall the selected Unreal Engine version.")
 
@@ -135,9 +137,11 @@ class UnrealManagerApp(Tk):
         self._button_launch.pack(side="right")
         self._bind_status_info(self._button_launch, "Launch the editor for the selected version and exit.")
         self._selected_version = StringVar()
+        self._selected_version.trace_add("write", lambda *_: self._button_remove.configure(
+            state="normal" if self._selected_version.get() else "disabled"))
         self._version_cards = {}  # radiobutton widgets keyed by version name
         self._setup_bindings()
-        self.refresh()
+        self.refresh(check_interrupted=True)
 
     @property
     def versions(self) -> list[str]:
@@ -208,12 +212,20 @@ class UnrealManagerApp(Tk):
         self._selected_version.set(self.versions[index])
         self._on_version_button_clicked()
 
-    def refresh(self):
+    def refresh(self, check_interrupted=False):
         """
         Re-scan /opt/unreal-engine and rebuild the list.
         """
-        self._versions = registry.load()
+        self._versions, interrupted = registry.load()
         self._rebuild_versions_scroll_frame()
+        if check_interrupted:
+            for path in interrupted:
+                if tk_msgbox_askyesno("Interrupted Installation",
+                                      f"Unreal Engine '{path.name}' did not finish installing.\n\n"
+                                      "Would you like to remove the incomplete installation?"):
+                    sh_rmtree(str(path), ignore_errors=True)
+            self._versions, _ = registry.load()
+            self._rebuild_versions_scroll_frame()
 
     def _rebuild_versions_scroll_frame(self):
         """
@@ -303,13 +315,26 @@ class UnrealManagerApp(Tk):
         """
         Handle clicks on the Remove button to uninstall a version.
         """
+        if not self._selected_version.get():
+            return
         proceed = tk_msgbox_askyesno(title="Confirmation",
                                      message=f"Are you sure you want to uninstall {self._selected_version.get()}?")
         if not proceed:
             return
-        sh_rmtree(f"{INSTALL_ROOT}/{self._selected_version.get()}")
-        system.remove_desktop_file(self._selected_version.get())
-        self.refresh()
+        dlg = Toplevel(self, background=_COLOR_BG_DARK)
+        dlg.title("Uninstalling")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        Label(dlg, text=f"Uninstalling {self._selected_version.get()}...").pack(expand=True, padx=40, pady=20)
+        Thread(target=lambda: (
+            sh_rmtree(f"{INSTALL_ROOT}/{self._selected_version.get()}"),
+            system.remove_desktop_file(self._selected_version.get()),
+            self.after(0, lambda: (
+                dlg.destroy(),
+                self.refresh(),
+                self._selected_version.set("") if not self.versions else None))
+        ), daemon=True).start()
 
     @staticmethod
     def _ensure_install_root_access():
@@ -384,7 +409,7 @@ class UnrealManagerApp(Tk):
 
         target_dir = INSTALL_ROOT / version_name
 
-        if target_dir.exists():
+        if target_dir.exists() and not (target_dir / ".installing").exists():
             tk_msgbox_showinfo("No operation!", f"Version '{version_name}' is already installed.")
             return
 
@@ -393,6 +418,8 @@ class UnrealManagerApp(Tk):
         dlg.transient(self)
         dlg.grab_set()
         dlg.resizable(False, False)
+        self._install_cancel = Event()
+        dlg.protocol("WM_DELETE_WINDOW", self._cancel_installation)
 
         info_label = Label(dlg, text=f"Installing to: {target_dir}", font=("TkDefaultFont", 8), wraplength=380)
         info_label.pack(padx=20, pady=(16, 8))
@@ -408,12 +435,16 @@ class UnrealManagerApp(Tk):
         self._install_thread = Thread(
             target=self._extract_and_setup,
             kwargs={"zip_path": zip_path, "target_dir": target_dir, "version_name": version_name, "dialog": dlg,
-                    "progress_bar": progress, "status_label": status_label},
+                    "progress_bar": progress, "status_label": status_label, "cancel_event": self._install_cancel},
             daemon=True)
         self._install_thread.start()
 
+    def _cancel_installation(self):
+        self._install_cancel.set()
+
     def _extract_and_setup(self, zip_path: str, target_dir: Path, version_name: str,
-                           dialog: Toplevel, progress_bar: Progressbar, status_label: Label):
+                           dialog: Toplevel, progress_bar: Progressbar,
+                           status_label: Label, cancel_event: Event):
         """
         Background worker: extract, validate, set permissions, update UI.
         :param zip_path: Path to the ZIP archive.
@@ -429,6 +460,7 @@ class UnrealManagerApp(Tk):
             gui.safe_set_text(status_label, "Creating installation directory...")
             INSTALL_ROOT.mkdir(parents=True, exist_ok=True)
             target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / ".installing").touch()
 
             # 2. Extract ZIP.
             gui.safe_set_text(status_label, "Extracting archive...")
@@ -445,6 +477,8 @@ class UnrealManagerApp(Tk):
                 gui.safe_set_text(status_label, f"Extracting... 0/{total} files (0%)")
 
                 for member in zip_file.infolist():
+                    if cancel_event.is_set():
+                        raise InterruptedError
                     zip_file.extract(member, str(target_dir))
                     done += 1
                     pct = int(done / total * 100)
@@ -487,6 +521,7 @@ class UnrealManagerApp(Tk):
             system.create_mime_xml_file()
 
             # 9. Set complete.
+            (target_dir / ".installing").unlink()
             gui.safe_set_text(status_label, "Success!")
             gui.safe_call(progress_bar, "stop")
             gui.safe_messagebox("Installation Complete",
@@ -494,6 +529,11 @@ class UnrealManagerApp(Tk):
                                 "info")
             gui.safe_destroy(dialog)
             # noinspection PyTypeChecker
+            self.after_idle(self.refresh)
+
+        except InterruptedError:
+            sh_rmtree(str(target_dir), ignore_errors=True)
+            gui.safe_destroy(dialog)
             self.after_idle(self.refresh)
 
         except ValueError as e:
