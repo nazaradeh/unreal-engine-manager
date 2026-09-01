@@ -85,7 +85,7 @@ class UnrealManagerApp(Tk):
 
         self._versions = dict[str, Path]()  # {name: path}
         self._install_thread: Thread
-        self._install_cancel: Event
+        self._install_cancel: Event = Event()
 
         # Header
         header = Frame(self, padding=(12, 8))
@@ -212,20 +212,28 @@ class UnrealManagerApp(Tk):
         self._selected_version.set(self.versions[index])
         self._on_version_button_clicked()
 
-    def refresh(self, check_interrupted=False):
+    def refresh(self, check_interrupted: bool = False):
         """
         Re-scan /opt/unreal-engine and rebuild the list.
+        :param check_interrupted: Whether to check for interrupted installations and prompt the user to remove them.
         """
-        self._versions, interrupted = registry.load()
+        installations = registry.load()
+        self._versions = {installation.version: installation.path
+                          for installation in installations
+                          if not installation.interrupted}
         self._rebuild_versions_scroll_frame()
-        if check_interrupted:
-            for path in interrupted:
+        if not check_interrupted:
+            return
+        for installation in installations:
+            if installation.interrupted:
                 if tk_msgbox_askyesno("Interrupted Installation",
-                                      f"Unreal Engine '{path.name}' did not finish installing.\n\n"
+                                      f"Unreal Engine '{installation.version}' did not finish installing.\n\n"
                                       "Would you like to remove the incomplete installation?"):
-                    sh_rmtree(str(path), ignore_errors=True)
-            self._versions, _ = registry.load()
-            self._rebuild_versions_scroll_frame()
+                    sh_rmtree(str(installation.path), ignore_errors=True)
+        installations = registry.load()
+        self._versions = {installation.version: installation.path for installation in installations
+                          if not installation.interrupted}
+        self._rebuild_versions_scroll_frame()
 
     def _rebuild_versions_scroll_frame(self):
         """
@@ -418,7 +426,6 @@ class UnrealManagerApp(Tk):
         dlg.transient(self)
         dlg.grab_set()
         dlg.resizable(False, False)
-        self._install_cancel = Event()
         dlg.protocol("WM_DELETE_WINDOW", self._cancel_installation)
 
         info_label = Label(dlg, text=f"Installing to: {target_dir}", font=("TkDefaultFont", 8), wraplength=380)
