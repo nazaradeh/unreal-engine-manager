@@ -16,13 +16,13 @@ class UnrealInstallation:
     path: Path
     """Path pointing to the root directory of the installation"""
 
-    interrupted: bool
+    interrupted: bool = False
     """Whether this is an interrupted and incomplete installation."""
 
-def load() -> list[UnrealInstallation]:
+def load() -> tuple[UnrealInstallation, ...]:
     """
     Loads the registry by scanning the installation root.
-    :return: A list of discovered Unreal Engine installations and whether they were interrupted during installation.
+    :return: Discovered Unreal Engine installations.
     """
     installations = []
 
@@ -36,4 +36,4 @@ def load() -> list[UnrealInstallation]:
             if interrupted or all((child / folder).exists() for folder in REQUIRED_FOLDERS):
                 installations.append(UnrealInstallation(child.name, child, interrupted))
 
-    return installations
+    return tuple(installations)
